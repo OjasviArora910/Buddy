@@ -1,0 +1,83 @@
+.newConversation,
+.conversationLink,
+.loadOlder {
+  border: 0;
+  border-radius: 10px;
+  padding: 11px 12px;
+  text-align: left;
+  color: #53675a;
+  background: transparent;
+  font-size: 13px;
+}
+
+.newConversation {
+  background: #e6ece5;
+  font-weight: 600;
+}
+
+.conversationList {
+  display: grid;
+  gap: 4px;
+  max-height: 45vh;
+  overflow: auto;
+}
+
+.conversationLink {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversationLink:hover,
+.conversationLink.selected {
+  background: #e6ece5;
+}
+
+.loadOlder {
+  align-self: center;
+  background: white;
+  border: 1px solid #e8e9e4;
+}
+
+.headerAction {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+}
+
+.mobileConversationControls {
+  display: none;
+}
+
+@media (max-width: 750px) {
+  .conversationList {
+    display: none;
+  }
+
+  .mobileConversationControls {
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px;
+    background: white;
+    border-bottom: 1px solid #e8e9e4;
+  }
+
+  .mobileConversationControls select {
+    flex: 1;
+    min-width: 0;
+    border: 1px solid #e8e9e4;
+    border-radius: 8px;
+    padding: 8px;
+    background: white;
+  }
+
+  .mobileConversationControls button {
+    border: 0;
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: #53675a;
+    background: #e6ece5;
+  }
+}
