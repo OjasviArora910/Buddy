@@ -2,7 +2,8 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { fetchApi, supabase } from '../../lib/supabase';
+import { fetchApi } from '../../lib/api';
+import { authClient } from '../../lib/auth';
 
 type Category = 'user_profile' | 'relationships' | 'life_events' | 'preferences' | 'open_threads';
 type Memory = {
@@ -36,11 +37,11 @@ export default function Memories() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
-  const [automaticEnabled, setAutomaticEnabled] = useState(true);
+  const [automaticEnabled, setAutomaticEnabled] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState(false);
 
   const request = useCallback(async (path: string, init: RequestInit = {}) => {
-    const { data: { session } } = await supabase().auth.getSession();
+    const { data: { session } } = await authClient().auth.getSession();
     if (!session) {
       router.push('/login');
       throw new Error('Please sign in to manage memories.');
@@ -180,12 +181,27 @@ export default function Memories() {
     }
   }
 
+  async function removeAll() {
+    if (!memories.length || !window.confirm('Permanently delete all saved memories?')) return;
+    setError('');
+    try {
+      await request('/memories', { method: 'DELETE' });
+      setMemories([]);
+      setNotice('All saved memories were permanently deleted.');
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : 'Could not delete saved memories.');
+    }
+  }
+
   return (
     <main className="centerPage">
       <div className="memoryCard">
         <Link className="back" href="/chat?mode=account">← Back to chat</Link>
         <h1>What Buddy remembers</h1>
         <p>You choose what is saved, how long it stays, and what Buddy can use.</p>
+        <button type="button" className="deleteMemory" disabled={!memories.length || busy} onClick={() => void removeAll()}>
+          Delete all saved memories
+        </button>
         <div className="info">
           When enabled, Buddy can automatically save non-sensitive useful details from account conversations, avoid duplicates,
           and update facts you correct. Sensitive details are never saved without explicit consent. Saved details are sent to

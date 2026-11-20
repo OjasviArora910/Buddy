@@ -1,0 +1,5 @@
+# Local PostgreSQL setup
+
+Install PostgreSQL 15 or later using the official installer/package for Windows, macOS, or Linux. Create an application database and a dedicated login role with a strong local password, grant that role access only to `buddy_db`, and set `DATABASE_URL=postgresql+psycopg://buddy_app:YOUR_PASSWORD@localhost:5432/buddy_db` in `backend/.env`. Do not reuse an administrator role.
+
+Install Python dependencies with `python -m pip install -r requirements.txt`, then apply the base schema through `0003_memory_metadata` from `backend` using `alembic upgrade 0003_memory_metadata`. This supports the app without pgvector. Do not stamp over pending revisions. Revision `0004_pgvector` is optional and must only be applied after installing the matching PostgreSQL server extension; see [local development](local-development.md). Alembic advances its recorded revision only after the migration actually succeeds. Back up with `pg_dump buddy_db > buddy_db.sql`; restore into an empty database with `psql buddy_db < buddy_db.sql`. There is no SQLite fallback.

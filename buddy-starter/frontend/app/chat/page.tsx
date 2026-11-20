@@ -4,7 +4,8 @@ import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import Link from 'next/link';
 import { ArrowUp, Heart, Mic, Square, LogOut, Brain, ShieldCheck } from 'lucide-react';
-import { fetchApi, supabase } from '../../lib/supabase';
+import { fetchApi } from '../../lib/api';
+import { authClient } from '../../lib/auth';
 import styles from './chat-controls.module.css';
 
 type Msg = { id?: string; role: 'user' | 'assistant'; content: string; created_at?: string };
@@ -62,7 +63,7 @@ function ChatInner() {
     if (mode === 'account') {
       (async () => {
         try {
-          const { data: { session } } = await supabase().auth.getSession();
+          const { data: { session } } = await authClient().auth.getSession();
           if (!session) {
             router.replace('/login');
             return;
@@ -120,7 +121,7 @@ function ChatInner() {
     try {
       let token = '';
       if (mode === 'account') {
-        const { data: { session } } = await supabase().auth.getSession();
+        const { data: { session } } = await authClient().auth.getSession();
         if (!session) {
           router.push('/login');
           return;
@@ -133,7 +134,7 @@ function ChatInner() {
           'Content-Type': 'application/json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({ mode, message: text, ...(mode === 'account' ? { conversation_id: conversationId } : {}) }),
+        body: JSON.stringify({ mode, message: text, ...(mode === 'account' ? { conversation_id: conversationId, request_id: crypto.randomUUID() } : {}) }),
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || 'Could not send message.');
@@ -163,7 +164,7 @@ function ChatInner() {
       if (busy || id === conversationId) return;
       setError('');
       try {
-        const { data: { session } } = await supabase().auth.getSession();
+        const { data: { session } } = await authClient().auth.getSession();
         if (!session) { router.push('/login'); return; }
         const response = await fetchApi(`/conversations/${id}/messages?limit=40`, {
           headers: { Authorization: `Bearer ${session.access_token}` },
@@ -182,7 +183,7 @@ function ChatInner() {
   async function createConversation() {
       setError('');
       try {
-        const { data: { session } } = await supabase().auth.getSession();
+        const { data: { session } } = await authClient().auth.getSession();
         if (!session) { router.push('/login'); return; }
         const response = await fetchApi('/conversations', {
           method: 'POST',
@@ -207,7 +208,7 @@ function ChatInner() {
       const title = window.prompt('Conversation name', conversation.title)?.trim();
       if (!title || title === conversation.title) return;
       try {
-        const { data: { session } } = await supabase().auth.getSession();
+        const { data: { session } } = await authClient().auth.getSession();
         if (!session) { router.push('/login'); return; }
         const response = await fetchApi(`/conversations/${conversationId}`, {
           method: 'PATCH',
@@ -225,7 +226,7 @@ function ChatInner() {
   async function deleteConversation() {
       if (!conversationId || !window.confirm('Delete this conversation and all of its messages?')) return;
       try {
-        const { data: { session } } = await supabase().auth.getSession();
+        const { data: { session } } = await authClient().auth.getSession();
         if (!session) { router.push('/login'); return; }
         const response = await fetchApi(`/conversations/${conversationId}`, {
           method: 'DELETE',
@@ -247,7 +248,7 @@ function ChatInner() {
       if (!conversationId || !messages[0]?.created_at || loadingOlder) return;
       setLoadingOlder(true);
       try {
-        const { data: { session } } = await supabase().auth.getSession();
+        const { data: { session } } = await authClient().auth.getSession();
         if (!session) { router.push('/login'); return; }
         const before = encodeURIComponent(messages[0].created_at);
         const response = await fetchApi(`/conversations/${conversationId}/messages?limit=40&before=${before}`, {
@@ -269,7 +270,7 @@ function ChatInner() {
     setSavingSuggestion(index);
     setError('');
     try {
-      const { data: { session } } = await supabase().auth.getSession();
+      const { data: { session } } = await authClient().auth.getSession();
       if (!session) {
         router.push('/login');
         return;
@@ -330,7 +331,7 @@ function ChatInner() {
   }
 
   async function logout() {
-    await supabase().auth.signOut();
+    await authClient().auth.signOut();
     router.push('/');
   }
 

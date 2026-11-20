@@ -1,4 +1,4 @@
--- Run in Supabase SQL editor. User-scoped database requests use verified JWTs and RLS.
+-- Historical Supabase schema retained for migration reference only; never apply for Buddy v3.
 create extension if not exists pgcrypto;
 create extension if not exists vector;
 create extension if not exists pg_cron;

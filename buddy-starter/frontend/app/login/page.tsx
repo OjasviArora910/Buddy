@@ -2,13 +2,14 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { supabase } from '../../lib/supabase';
+import { createUserWithEmailAndPassword, GoogleAuthProvider, sendEmailVerification, sendPasswordResetEmail, signInWithEmailAndPassword, signInWithPopup } from 'firebase/auth';
+import { firebaseAuth } from '../../lib/firebase';
 
-export default function Login() {
+export default function Login({ initialSignup = false }: { initialSignup?: boolean }) {
   const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [signup, setSignup] = useState(false);
+  const [signup, setSignup] = useState(initialSignup);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
@@ -20,25 +21,18 @@ export default function Login() {
     setNotice('');
 
     try {
-      const client = supabase();
+      const auth = firebaseAuth();
       const normalizedEmail = email.trim();
-      const result = signup
-        ? await client.auth.signUp({
-            email: normalizedEmail,
-            password,
-            options: {
-              emailRedirectTo: `${window.location.origin}/chat?mode=account`,
-            },
-          })
-        : await client.auth.signInWithPassword({
-            email: normalizedEmail,
-            password,
-          });
-
-      if (result.error) throw result.error;
-      if (signup && !result.data.session) {
+      const credential = signup
+        ? await createUserWithEmailAndPassword(auth, normalizedEmail, password)
+        : await signInWithEmailAndPassword(auth, normalizedEmail, password);
+      if (signup) {
+        await sendEmailVerification(credential.user, { url: `${window.location.origin}/chat?mode=account` });
         setPassword('');
-        setNotice('Account created. Check your email to confirm your account, then sign in.');
+        setNotice('Account created. Check your email to verify it, then sign in.');
+      } else if (!credential.user.emailVerified) {
+        await sendEmailVerification(credential.user);
+        setNotice('Please verify your email. We sent another verification link.');
       } else {
         router.push('/chat?mode=account');
       }
@@ -55,20 +49,24 @@ export default function Login() {
     setBusy(true);
 
     try {
-      const { error: authError } = await supabase().auth.signInWithOAuth({
-        provider: 'google',
-        options: { redirectTo: `${window.location.origin}/chat?mode=account` },
-      });
-      if (authError) throw authError;
+      await signInWithPopup(firebaseAuth(), new GoogleAuthProvider());
+      router.push('/chat?mode=account');
     } catch (authError) {
       const message = authError instanceof Error ? authError.message : 'Google sign-in failed.';
       setError(
         message.toLowerCase().includes('provider') && message.toLowerCase().includes('not enabled')
-          ? 'Google sign-in is not enabled for this Supabase project. Use email and password, or enable Google in Supabase Auth settings.'
+          ? 'Google sign-in is not enabled for this Firebase project. Use email and password, or enable Google in Firebase Authentication.'
           : message,
       );
       setBusy(false);
     }
+  }
+
+  async function resetPassword() {
+    setError(''); setNotice('');
+    if (!email.trim()) { setError('Enter your email address first.'); return; }
+    try { await sendPasswordResetEmail(firebaseAuth(), email.trim()); setNotice('If that account exists, a password reset email is on its way.'); }
+    catch (error) { setError(error instanceof Error ? error.message : 'Could not send the reset email.'); }
   }
 
   function toggleMode() {
@@ -116,6 +114,7 @@ export default function Login() {
             {busy ? 'Please wait…' : signup ? 'Create account' : 'Sign in'}
           </button>
         </form>
+        {!signup && <button className="switch" type="button" onClick={() => void resetPassword()} disabled={busy}>Forgot password?</button>}
         {error && <p role="alert" className="error">{error}</p>}
         {notice && <p role="status" className="success">{notice}</p>}
         <p className="switch">
