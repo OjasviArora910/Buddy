@@ -11,6 +11,7 @@ type Memory = {
   content: string;
   category: Category;
   sensitive: boolean;
+  source?: 'learned_from_chat' | 'manual';
   source_reason: string;
   retention_days: number | null;
   expires_at: string | null;
@@ -171,6 +172,7 @@ export default function Memories() {
   }
 
   async function remove(memory: Memory) {
+    if (!window.confirm('Delete this saved fact from Buddy’s memory? Your conversation messages will remain.')) return;
     setError('');
     try {
       await request(`/memories/${memory.id}`, { method: 'DELETE' });
@@ -182,7 +184,7 @@ export default function Memories() {
   }
 
   async function removeAll() {
-    if (!memories.length || !window.confirm('Permanently delete all saved memories?')) return;
+    if (!memories.length || !window.confirm('Permanently delete all saved facts? Conversation messages will remain.')) return;
     setError('');
     try {
       await request('/memories', { method: 'DELETE' });
@@ -200,12 +202,10 @@ export default function Memories() {
         <h1>What Buddy remembers</h1>
         <p>You choose what is saved, how long it stays, and what Buddy can use.</p>
         <button type="button" className="deleteMemory" disabled={!memories.length || busy} onClick={() => void removeAll()}>
-          Delete all saved memories
+          Delete all saved facts
         </button>
         <div className="info">
-          When enabled, Buddy can automatically save non-sensitive useful details from account conversations, avoid duplicates,
-          and update facts you correct. Sensitive details are never saved without explicit consent. Saved details are sent to
-          Gemini for replies and embeddings; avoid saving anything you do not want processed by that provider.
+          This setting controls both using saved facts in replies and automatically saving suitable details from account chats. Turning it off stops recall and automatic saving; existing facts stay here until you delete them or they expire. Sensitive details are not automatically saved and require your explicit consent for manual saving. Saved facts are sent to Gemini when used for replies. Deleting a conversation removes its messages but keeps saved facts; deleting a fact removes it from future recall but keeps conversation messages.
         </div>
         <label className="memoryToggle">
           <input
@@ -214,7 +214,7 @@ export default function Memories() {
             disabled={settingsBusy}
             onChange={(event) => void toggleAutomaticMemory(event.target.checked)}
           />
-          Enable automatic memory
+          Enable recall and automatic saving
         </label>
         <form onSubmit={add} className="memoryForm memoryAddForm">
           <input
@@ -264,7 +264,7 @@ export default function Memories() {
                 <>
                   <div className="memoryContent">
                     <span>{memory.content}</span>
-                    <small>{categories.find((item) => item.value === memory.category)?.label}{memory.sensitive ? ' · Sensitive' : ''}</small>
+                    <small>{memory.source === 'learned_from_chat' ? 'Learned from chat' : 'Added by you'} · {categories.find((item) => item.value === memory.category)?.label}{memory.sensitive ? ' · Sensitive' : ''}</small>
                     <small>Why saved: {memory.source_reason}</small>
                   </div>
                   <label className="retentionLabel">

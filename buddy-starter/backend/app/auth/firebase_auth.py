@@ -50,7 +50,7 @@ def firebase_app():
                 # never reaches the user's gcloud ADC credentials.
                 os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
             # Without an explicit credential, Firebase Admin uses Google ADC.
-            app = firebase_admin.initialize_app(options={"projectId": "buddy-c8a0c"})
+            app = firebase_admin.initialize_app(options={"projectId": project_id})
         if app.project_id != project_id:
             raise RuntimeError("Existing Firebase Admin app uses a different project")
         return app

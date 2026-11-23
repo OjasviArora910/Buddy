@@ -40,9 +40,12 @@ function ChatInner() {
   const params = useSearchParams();
   const router = useRouter();
   const mode = params.get('mode') === 'account' ? 'account' : 'quick';
+  const requestedConversationId = mode === 'account' ? (params.get('conversation_id') || '') : '';
   const [messages, setMessages] = useState<Msg[]>([]);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [conversationId, setConversationId] = useState('');
+  const [loadedConversationId, setLoadedConversationId] = useState('');
+  const [loadedMode, setLoadedMode] = useState<'account' | 'quick'>('quick');
   const [hasOlderMessages, setHasOlderMessages] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [draft, setDraft] = useState('');
@@ -55,65 +58,102 @@ function ChatInner() {
   const [ready, setReady] = useState(mode === 'quick');
   const [recording, setRecording] = useState(false);
   const [safety, setSafety] = useState(false);
+  const creatingConversation = useRef(false);
+  const activeConversation = useRef('');
   const bottom = useRef<HTMLDivElement>(null);
   const recognition = useRef<SpeechRecognitionLike | null>(null);
+  const currentConversation = conversations.find((item) => item.id === (requestedConversationId || conversationId));
+  const openingRequestedConversation = mode === 'account' && (!ready || loadedConversationId !== requestedConversationId);
+  const visibleMessages = mode !== loadedMode || openingRequestedConversation ? [] : messages;
 
   useEffect(() => {
     let active = true;
-    if (mode === 'account') {
-      (async () => {
-        try {
-          const { data: { session } } = await authClient().auth.getSession();
-          if (!session) {
-            router.replace('/login');
-            return;
-          }
-          const response = await fetchApi('/conversations', {
-            headers: { Authorization: `Bearer ${session.access_token}` },
-          });
-          if (!response.ok) throw new Error('Could not load conversations. Check that the database migration has been run.');
-          const savedConversations: Conversation[] = await response.json();
-          let selected = savedConversations[0];
-          if (!selected) {
-            const created = await fetchApi('/conversations', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
-              body: JSON.stringify({ title: 'New conversation' }),
-            });
-            if (!created.ok) throw new Error('Could not start an account conversation.');
-            selected = await created.json();
-            savedConversations.unshift(selected);
-          }
-          const historyResponse = await fetchApi(`/conversations/${selected.id}/messages?limit=40`, {
-            headers: { Authorization: `Bearer ${session.access_token}` },
-          });
-          if (!historyResponse.ok) throw new Error('Could not open this conversation.');
-          const history: Msg[] = await historyResponse.json();
-          if (active) {
-            setConversations(savedConversations);
-            setConversationId(selected.id);
-            setMessages(history);
-            setHasOlderMessages(history.length === 40);
-          }
-        } catch (requestError) {
-          if (active) setError(requestError instanceof Error ? requestError.message : 'Unable to load account.');
-        } finally {
-          if (active) setReady(true);
-        }
-      })();
+    activeConversation.current = requestedConversationId;
+    if (mode !== 'account') {
+      setConversations([]);
+      setConversationId('');
+      setLoadedConversationId('');
+      setMessages([]);
+      setSuggestions([]);
+      setLoadedMode('quick');
+      setReady(true);
+      return () => { active = false; };
     }
+    setReady(false);
+    setError('');
+    setMessages([]);
+    setSuggestions([]);
+    setHasOlderMessages(false);
+    (async () => {
+      try {
+        const { data: { session } } = await authClient().auth.getSession();
+        if (!session) { router.replace('/login'); return; }
+        const headers = { Authorization: `Bearer ${session.access_token}` };
+        const listResponse = await fetchApi('/conversations', { headers });
+        if (!listResponse.ok) throw new Error('Could not load your conversations. Please refresh and try again.');
+        const savedConversations: Conversation[] = await listResponse.json();
+        if (!active) return;
+        setConversations(savedConversations);
+        const selectedId = requestedConversationId || savedConversations[0]?.id || '';
+        if (!selectedId) {
+          setConversationId('');
+          setMessages([]);
+          setLoadedConversationId('');
+          setLoadedMode('account');
+          setReady(true);
+          return;
+        }
+        if (!requestedConversationId) {
+          router.replace(`/chat?mode=account&conversation_id=${encodeURIComponent(selectedId)}`);
+        }
+        const historyResponse = await fetchApi(`/conversations/${selectedId}/messages?limit=40`, { headers });
+        if (!historyResponse.ok) {
+          const details = await historyResponse.json().catch(() => ({}));
+          const statusText = historyResponse.status === 404
+            ? 'This conversation was deleted or no longer exists.'
+            : historyResponse.status === 403
+              ? 'You do not have access to this conversation.'
+              : details.detail || 'Could not open this conversation. Please try again.';
+          throw new Error(statusText);
+        }
+        const history: Msg[] = await historyResponse.json();
+        if (active && activeConversation.current === selectedId) {
+          setConversationId(selectedId);
+          setLoadedConversationId(selectedId);
+          setLoadedMode('account');
+          setMessages(history);
+          setHasOlderMessages(history.length === 40);
+        }
+      } catch (requestError) {
+        if (active) {
+          setConversationId('');
+          setLoadedConversationId(requestedConversationId);
+          setLoadedMode('account');
+          setMessages([]);
+          setError(requestError instanceof Error ? requestError.message : 'Could not open this conversation.');
+        }
+      } finally {
+        if (active) setReady(true);
+      }
+    })();
     return () => { active = false; };
-  }, [mode, router]);
+  }, [mode, requestedConversationId, router]);
 
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, busy, suggestions]);
 
   async function send() {
     const text = draft.trim();
     if (!text || busy) return;
-    const next: Msg[] = [...messages, { role: 'user', content: text }];
-    setMessages(next);
-    setDraft('');
     setBusy(true);
+    let targetConversationId = conversationId;
+    if (mode === 'account' && !targetConversationId) {
+      const created = await createConversation();
+      if (!created) { setBusy(false); return; }
+      targetConversationId = created.id;
+    }
+    const next: Msg[] = [...messages, { role: 'user', content: text }];
+    if (mode !== 'account' || activeConversation.current === targetConversationId) setMessages(next);
+    setDraft('');
     setError('');
     setMemoryNotice('');
     setPersistenceNotice('');
@@ -134,57 +174,51 @@ function ChatInner() {
           'Content-Type': 'application/json',
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({ mode, message: text, ...(mode === 'account' ? { conversation_id: conversationId, request_id: crypto.randomUUID() } : {}) }),
+        body: JSON.stringify({ mode, message: text, ...(mode === 'account' ? { conversation_id: targetConversationId, request_id: crypto.randomUUID() } : {}) }),
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || 'Could not send message.');
       const updatedMessages = [...next, { role: 'assistant' as const, content: body.reply }];
-      setMessages(updatedMessages);
-      if (mode === 'account' && messages.length === 0) {
-        setConversations((current) => current.map((conversation) =>
-          conversation.id === conversationId
-            ? { ...conversation, title: text.slice(0, 60), updated_at: new Date().toISOString() }
-            : conversation,
-        ));
+      if (mode !== 'account' || activeConversation.current === targetConversationId) setMessages(updatedMessages);
+      if (mode === 'account' && body.conversation) {
+        const updatedConversation = body.conversation as Conversation;
+        setConversations((current) => [updatedConversation, ...current.filter((item) => item.id !== updatedConversation.id)]);
       }
-      setSafety(Boolean(body.safety_notice));
-      setMemoryNotice(body.memory_notice || '');
-      setPersistenceNotice(body.persistence_notice || '');
-      setSuggestions(body.memory_suggestions || []);
+      if (mode !== 'account' || activeConversation.current === targetConversationId) {
+        setSafety(Boolean(body.safety_notice));
+        setMemoryNotice(body.memory_notice || '');
+        setPersistenceNotice(body.persistence_notice || '');
+        setSuggestions(body.memory_suggestions || []);
+      }
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Something went wrong.');
-      setDraft(text);
-      setMessages(messages);
+      if (mode !== 'account' || activeConversation.current === targetConversationId) {
+        setError(requestError instanceof Error ? requestError.message : 'Something went wrong.');
+        setDraft(text);
+        setMessages(messages);
+      }
     } finally {
       setBusy(false);
     }
   }
 
-  async function selectConversation(id: string) {
-      if (busy || id === conversationId) return;
+  function selectConversation(id: string) {
+      if (!id || id === requestedConversationId) return;
+      activeConversation.current = id;
+      setReady(false);
+      setMessages([]);
       setError('');
-      try {
-        const { data: { session } } = await authClient().auth.getSession();
-        if (!session) { router.push('/login'); return; }
-        const response = await fetchApi(`/conversations/${id}/messages?limit=40`, {
-          headers: { Authorization: `Bearer ${session.access_token}` },
-        });
-        if (!response.ok) throw new Error('Could not open this conversation.');
-        const history: Msg[] = await response.json();
-        setConversationId(id);
-        setMessages(history);
-        setHasOlderMessages(history.length === 40);
-        setSuggestions([]);
-      } catch (requestError) {
-        setError(requestError instanceof Error ? requestError.message : 'Could not open conversation.');
-      }
+      setConversationId(id);
+      setLoadedConversationId('');
+      router.push(`/chat?mode=account&conversation_id=${encodeURIComponent(id)}`);
   }
 
-  async function createConversation() {
+  async function createConversation(): Promise<Conversation | null> {
+      if (creatingConversation.current) return null;
+      creatingConversation.current = true;
       setError('');
       try {
         const { data: { session } } = await authClient().auth.getSession();
-        if (!session) { router.push('/login'); return; }
+        if (!session) { router.push('/login'); return null; }
         const response = await fetchApi('/conversations', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
@@ -194,11 +228,19 @@ function ChatInner() {
         const conversation: Conversation = await response.json();
         setConversations((current) => [conversation, ...current]);
         setConversationId(conversation.id);
+        setLoadedConversationId(conversation.id);
+        activeConversation.current = conversation.id;
         setMessages([]);
         setSuggestions([]);
         setHasOlderMessages(false);
+        setReady(true);
+        router.push(`/chat?mode=account&conversation_id=${encodeURIComponent(conversation.id)}`);
+        return conversation;
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : 'Could not create conversation.');
+        return null;
+      } finally {
+        creatingConversation.current = false;
       }
   }
 
@@ -224,21 +266,27 @@ function ChatInner() {
   }
 
   async function deleteConversation() {
-      if (!conversationId || !window.confirm('Delete this conversation and all of its messages?')) return;
+      if (!conversationId || !window.confirm('Delete this conversation and all messages in it? Saved facts on What Buddy remembers will remain.')) return;
+      const targetId = conversationId;
       try {
         const { data: { session } } = await authClient().auth.getSession();
         if (!session) { router.push('/login'); return; }
-        const response = await fetchApi(`/conversations/${conversationId}`, {
+        const response = await fetchApi(`/conversations/${targetId}`, {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${session.access_token}` },
         });
         if (!response.ok) throw new Error('Could not delete this conversation.');
-        const remaining = conversations.filter((item) => item.id !== conversationId);
+        const remaining = conversations.filter((item) => item.id !== targetId);
         setConversations(remaining);
+        if (activeConversation.current !== targetId) return;
         setConversationId('');
         setMessages([]);
-        if (remaining[0]) await selectConversation(remaining[0].id);
-        else await createConversation();
+        setLoadedConversationId('');
+        if (remaining[0]) selectConversation(remaining[0].id);
+        else {
+          activeConversation.current = '';
+          router.replace('/chat?mode=account');
+        }
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : 'Could not delete conversation.');
       }
@@ -256,8 +304,10 @@ function ChatInner() {
         });
         if (!response.ok) throw new Error('Could not load older messages.');
         const older: Msg[] = await response.json();
-        setMessages((current) => [...older, ...current]);
-        setHasOlderMessages(older.length === 40);
+        if (activeConversation.current === conversationId) {
+          setMessages((current) => [...older, ...current]);
+          setHasOlderMessages(older.length === 40);
+        }
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : 'Could not load older messages.');
       } finally {
@@ -352,7 +402,7 @@ function ChatInner() {
                   <button
                     type="button"
                     key={conversation.id}
-                    className={`${styles.conversationLink} ${conversation.id === conversationId ? styles.selected : ''}`}
+                    className={`${styles.conversationLink} ${conversation.id === (requestedConversationId || conversationId) ? styles.selected : ''}`}
                     onClick={() => void selectConversation(conversation.id)}
                     title={conversation.title}
                   >
@@ -375,14 +425,14 @@ function ChatInner() {
         <header className="chatHeader">
           <div className="mobileBrand">buddy<span className="branddot">.</span></div>
           <div className="chatTitle">
-            <strong>Buddy</strong>
+            <strong>{mode === 'account' ? (currentConversation?.title || 'Your Buddy') : 'Buddy'}</strong>
             <span>{mode === 'quick' ? 'Quick chat · Not saved' : 'Your Buddy · Account memory'}</span>
           </div>
           <div className="headerLinks">
             {mode === 'account' && (
               <>
-                <button className={styles.headerAction} type="button" onClick={() => void renameConversation()}>Rename</button>
-                <button className={styles.headerAction} type="button" onClick={() => void deleteConversation()}>Delete</button>
+                <button className={styles.headerAction} type="button" disabled={!conversationId || !ready} onClick={() => void renameConversation()}>Rename</button>
+                <button className={styles.headerAction} type="button" disabled={!conversationId || !ready || busy} onClick={() => void deleteConversation()}>Delete</button>
                 <Link href="/memories">Memories</Link>
               </>
             )}
@@ -392,10 +442,11 @@ function ChatInner() {
         {mode === 'account' && (
           <div className={styles.mobileConversationControls}>
             <select
-              value={conversationId}
+              value={requestedConversationId || conversationId}
               onChange={(event) => void selectConversation(event.target.value)}
               aria-label="Select conversation"
             >
+              {!conversations.length && <option value="">No conversations yet</option>}
               {conversations.map((conversation) => (
                 <option key={conversation.id} value={conversation.id}>{conversation.title}</option>
               ))}
@@ -405,12 +456,21 @@ function ChatInner() {
         )}
         <div className="messageArea">
           <div className="conversation">
-            {mode === 'account' && hasOlderMessages && (
+            {openingRequestedConversation && <div className="welcome"><p>Opening conversation…</p></div>}
+            {mode === 'account' && ready && !conversationId && !requestedConversationId && conversations.length === 0 && messages.length === 0 && (
+              <div className="welcome">
+                <div className="welcomeIcon"><Heart size={28} /></div>
+                <h1>Start a conversation.</h1>
+                <p>Your chats will appear here after your first message.</p>
+                <span>No empty conversation is saved when you refresh this page.</span>
+              </div>
+            )}
+            {mode === 'account' && !openingRequestedConversation && hasOlderMessages && (
               <button type="button" className={styles.loadOlder} disabled={loadingOlder} onClick={() => void loadOlderMessages()}>
                 {loadingOlder ? 'Loading…' : 'Load older messages'}
               </button>
             )}
-            {messages.length === 0 && (
+            {!openingRequestedConversation && visibleMessages.length === 0 && !(mode === 'account' && ready && !conversationId && !requestedConversationId && conversations.length === 0) && (
               <div className="welcome">
                 <div className="welcomeIcon"><Heart size={28} /></div>
                 <h1>Hey, I&apos;m Buddy.</h1>
@@ -418,9 +478,14 @@ function ChatInner() {
                 <span>I&apos;m an AI companion, not a therapist.</span>
               </div>
             )}
-            {messages.map((message, index) => (
+            {visibleMessages.map((message, index) => (
               <div key={index} className={'bubble ' + (message.role === 'user' ? 'mine' : 'theirs')}>{message.content}</div>
             ))}
+            {mode === 'account' && requestedConversationId && error && ready && !conversationId && (
+              <button type="button" className={styles.newConversation} onClick={() => void createConversation()}>
+                Start a new conversation
+              </button>
+            )}
             {busy && <div className="bubble theirs typing">Buddy is thinking…</div>}
             {safety && <div className="safety">If you&apos;re in immediate danger, contact local emergency services or a trusted person. In India: 112 · Tele-MANAS: 14416. Numbers must be verified before a public launch.</div>}
             {suggestions.map((suggestion, index) => (

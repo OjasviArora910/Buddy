@@ -5,6 +5,24 @@ import { useRouter } from 'next/navigation';
 import { createUserWithEmailAndPassword, GoogleAuthProvider, sendEmailVerification, sendPasswordResetEmail, signInWithEmailAndPassword, signInWithPopup } from 'firebase/auth';
 import { firebaseAuth } from '../../lib/firebase';
 
+function friendlyAuthError(error: unknown, signingUp: boolean): string {
+  const code = typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code)
+    : '';
+  if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found') {
+    return 'Those sign-in details did not match. Check your email and password, or reset your password.';
+  }
+  if (code === 'auth/email-already-in-use') return 'An account already uses this email. Try signing in instead.';
+  if (code === 'auth/weak-password') return 'Choose a stronger password with at least six characters.';
+  if (code === 'auth/too-many-requests') return 'Too many attempts. Wait a little while, then try again.';
+  if (code === 'auth/network-request-failed') return 'Connection problem. Check your internet connection and try again.';
+  if (code === 'auth/popup-closed-by-user') return 'Google sign-in was closed before it finished. Try again when you are ready.';
+  if (code === 'auth/popup-blocked') return 'Your browser blocked the Google sign-in window. Allow the popup or use email and password.';
+  return signingUp
+    ? 'We could not create your account. Check your details and connection, then try again.'
+    : 'We could not sign you in. Check your details and connection, then try again.';
+}
+
 export default function Login({ initialSignup = false }: { initialSignup?: boolean }) {
   const router = useRouter();
   const [email, setEmail] = useState('');
@@ -37,7 +55,7 @@ export default function Login({ initialSignup = false }: { initialSignup?: boole
         router.push('/chat?mode=account');
       }
     } catch (authError) {
-      setError(authError instanceof Error ? authError.message : 'Authentication failed. Please try again.');
+      setError(friendlyAuthError(authError, signup));
     } finally {
       setBusy(false);
     }
@@ -52,12 +70,10 @@ export default function Login({ initialSignup = false }: { initialSignup?: boole
       await signInWithPopup(firebaseAuth(), new GoogleAuthProvider());
       router.push('/chat?mode=account');
     } catch (authError) {
-      const message = authError instanceof Error ? authError.message : 'Google sign-in failed.';
-      setError(
-        message.toLowerCase().includes('provider') && message.toLowerCase().includes('not enabled')
-          ? 'Google sign-in is not enabled for this Firebase project. Use email and password, or enable Google in Firebase Authentication.'
-          : message,
-      );
+      const code = typeof authError === 'object' && authError !== null && 'code' in authError ? String((authError as { code?: unknown }).code) : '';
+      setError(code === 'auth/operation-not-allowed'
+        ? 'Google sign-in is not enabled for this project. Use email and password, or ask an administrator to enable it.'
+        : friendlyAuthError(authError, false));
       setBusy(false);
     }
   }
@@ -65,8 +81,10 @@ export default function Login({ initialSignup = false }: { initialSignup?: boole
   async function resetPassword() {
     setError(''); setNotice('');
     if (!email.trim()) { setError('Enter your email address first.'); return; }
+    setBusy(true);
     try { await sendPasswordResetEmail(firebaseAuth(), email.trim()); setNotice('If that account exists, a password reset email is on its way.'); }
-    catch (error) { setError(error instanceof Error ? error.message : 'Could not send the reset email.'); }
+    catch (error) { setError(friendlyAuthError(error, false)); }
+    finally { setBusy(false); }
   }
 
   function toggleMode() {
@@ -81,7 +99,7 @@ export default function Login({ initialSignup = false }: { initialSignup?: boole
         <Link className="back" href="/">← Back</Link>
         <div className="brand centerBrand">buddy<span className="branddot">.</span></div>
         <h1>{signup ? 'Create your space' : 'Welcome back'}</h1>
-        <p>{signup ? 'Create an account to save your conversations.' : 'Pick up right where you left off.'}</p>
+        <p>{signup ? 'Create a space for your conversations and saved details.' : 'Sign in to reopen your conversations and saved details.'}</p>
         <button className="google" type="button" onClick={google} disabled={busy}>
           Continue with Google
         </button>
@@ -94,7 +112,7 @@ export default function Login({ initialSignup = false }: { initialSignup?: boole
               autoComplete="email"
               required
               value={email}
-              onChange={(event) => setEmail(event.target.value)}
+              onChange={(event) => { setEmail(event.target.value); setError(''); }}
               placeholder="you@example.com"
             />
           </label>
@@ -106,7 +124,7 @@ export default function Login({ initialSignup = false }: { initialSignup?: boole
               required
               minLength={6}
               value={password}
-              onChange={(event) => setPassword(event.target.value)}
+              onChange={(event) => { setPassword(event.target.value); setError(''); }}
               placeholder="At least 6 characters"
             />
           </label>
@@ -114,6 +132,7 @@ export default function Login({ initialSignup = false }: { initialSignup?: boole
             {busy ? 'Please wait…' : signup ? 'Create account' : 'Sign in'}
           </button>
         </form>
+        {busy && <p className="success" role="status" aria-live="polite">Please wait while we securely connect your account…</p>}
         {!signup && <button className="switch" type="button" onClick={() => void resetPassword()} disabled={busy}>Forgot password?</button>}
         {error && <p role="alert" className="error">{error}</p>}
         {notice && <p role="status" className="success">{notice}</p>}
