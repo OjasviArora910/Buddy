@@ -33,6 +33,12 @@
   background: #e6ece5;
 }
 
+.accountName {
+  font-weight: 600;
+  color: #53675a;
+  overflow-wrap: anywhere;
+}
+
 .loadOlder {
   align-self: center;
   background: white;

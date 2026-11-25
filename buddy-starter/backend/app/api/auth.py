@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from app.auth.firebase_auth import verified_firebase_claims, verified_firebase_uid
 from app.db.models import User, UserPreference
@@ -14,10 +15,18 @@ def _profile(user: User) -> dict:
 def _provision(db: Session, uid: str, claims: dict | None = None) -> User:
     user = db.scalar(select(User).where(User.firebase_uid == uid))
     if user is None:
-        user = User(firebase_uid=uid)
-        db.add(user)
-        db.flush()
-        db.add(UserPreference(user_id=user.id, memory_enabled=False))
+        try:
+            user = User(firebase_uid=uid)
+            db.add(user)
+            db.flush()
+            db.add(UserPreference(user_id=user.id, memory_enabled=False))
+            db.flush()
+        except IntegrityError:
+            # Parallel first requests: another request created the row first.
+            db.rollback()
+            user = db.scalar(select(User).where(User.firebase_uid == uid))
+            if user is None:
+                raise
     if claims:
         user.email = claims.get("email") or user.email
         user.display_name = claims.get("name") or user.display_name

@@ -74,9 +74,42 @@ class FirebaseTokenTests(unittest.TestCase):
             firebase_auth.verified_firebase_uid(None)
         self.assertEqual(error.exception.status_code, 401)
 
+    def test_protected_identity_dependencies_require_verified_email(self):
+        unverified = {"uid": "uid-1", "email": "person@example.test", "email_verified": False}
+        with patch.object(firebase_auth, "verify_token", return_value=unverified):
+            with self.assertRaises(HTTPException) as claims_error:
+                firebase_auth.verified_firebase_claims("Bearer test")
+            with self.assertRaises(HTTPException) as uid_error:
+                firebase_auth.verified_firebase_uid("Bearer test")
+        self.assertEqual(claims_error.exception.status_code, 403)
+        self.assertEqual(uid_error.exception.status_code, 403)
+        self.assertIn("Verify your email", claims_error.exception.detail)
+
+    def test_verified_email_claim_is_accepted(self):
+        claims = {"uid": "uid-1", "aud": "buddy-test", "email_verified": True}
+        with patch.dict(os.environ, {"FIREBASE_PROJECT_ID": "buddy-test"}), \
+             patch.object(firebase_auth, "firebase_app", return_value=object()), \
+             patch.object(firebase_auth.auth, "verify_id_token", return_value=claims):
+            self.assertEqual(firebase_auth.verified_firebase_claims("Bearer test"), claims)
+
     def test_profile_endpoint_rejects_missing_token_before_database_access(self):
         response = TestClient(app).get("/auth/me")
         self.assertEqual(response.status_code, 401)
+
+    def test_request_id_header_is_echoed_and_allowed_by_cors(self):
+        client = TestClient(app)
+        # Expose-Headers is sent on the real cross-origin response (not the preflight),
+        # and is what lets browser JavaScript read the echoed request ID.
+        response = client.get("/health", headers={"X-Request-ID": "buddy-test-request-001", "Origin": "http://localhost:3000"})
+        self.assertEqual(response.headers.get("X-Request-ID"), "buddy-test-request-001")
+        self.assertIn("x-request-id", response.headers.get("access-control-expose-headers", "").lower())
+        preflight = client.options("/chat", headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type,x-request-id",
+        })
+        self.assertEqual(preflight.status_code, 200)
+        self.assertIn("x-request-id", preflight.headers.get("access-control-allow-headers", "").lower())
 
 
 if __name__ == "__main__":

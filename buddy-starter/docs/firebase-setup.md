@@ -17,3 +17,7 @@
 7. The frontend sends Firebase ID tokens in `Authorization: Bearer …`; Firebase Admin verifies the token signature and expiry, then the backend also checks that token audience (`aud`) matches `FIREBASE_PROJECT_ID`. A token from a different frontend project is rejected with 401.
 
 The Google provider and email flow require project settings above. No credentials are included in this repository.
+
+## Email verification settings
+
+Enable Email/Password (and Google) sign-in, keep **email enumeration protection** on, and review the verification email template. Add every origin that serves the frontend (for example `localhost`) to Authentication > Settings > Authorized domains, since the verification link continues to `/chat?mode=account` on the page origin. Verification email delivery and the Google popup can only be confirmed against a live Firebase project.

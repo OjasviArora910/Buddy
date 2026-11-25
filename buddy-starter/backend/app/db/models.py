@@ -73,6 +73,8 @@ class Memory(Base):
     last_mentioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     follow_up_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_followed_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    follow_up_question: Mapped[str | None] = mapped_column(String(240))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

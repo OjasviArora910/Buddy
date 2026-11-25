@@ -15,6 +15,38 @@ from app.services.memory import CandidateList, _similarity
 
 
 class MemoryAndIsolationTests(unittest.TestCase):
+    def test_gemini_payload_labels_all_three_context_sources(self):
+        class Response:
+            def raise_for_status(self): pass
+            def json(self): return {"candidates": [{"content": {"parts": [{"text": "A useful reply."}]}}]}
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+            async def post(self, _url, **kwargs):
+                captured["payload"] = kwargs["json"]
+                return Response()
+        captured = {}
+        fact = SimpleNamespace(content="Likes concise replies", category="preferences")
+        messages = [{"role": "user", "content": "And what about work?"}]
+        past = [{"content": "My final-year project detects crop disease.", "created_at": "2026-01-01T00:00:00+00:00"}]
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-key"}), patch.object(main.httpx, "AsyncClient", return_value=Client()):
+            reply = asyncio.run(main._gemini(messages, [fact], past_excerpts=past))
+        prompt = captured["payload"]["systemInstruction"]["parts"][0]["text"]
+        self.assertEqual(reply, "A useful reply.")
+        self.assertIn("CURRENT CONVERSATION MESSAGES", prompt)
+        self.assertIn("SELECTED SAVED FACTS", prompt)
+        self.assertIn("Likes concise replies", prompt)
+        self.assertIn("RELEVANT PAST-CHAT EXCERPTS", prompt)
+        self.assertIn("crop disease", prompt)
+        self.assertEqual(captured["payload"]["contents"][0]["parts"][0]["text"], messages[0]["content"])
+
+    def test_transcript_recall_excludes_sensitive_and_tombstoned_text(self):
+        self.assertTrue(memory_service._TRANSCRIPT_SENSITIVE.search("I am taking medication for a health condition."))
+        self.assertFalse(memory_service._TRANSCRIPT_SENSITIVE.search("My final-year project detects crop disease."))
+        fingerprint = memory_service.content_fingerprint("my cat's name is piku")
+        self.assertTrue(memory_service._tombstoned_excerpt("I told Buddy my cat's name is Piku yesterday.", {fingerprint}))
+        self.assertFalse(memory_service._tombstoned_excerpt("My final-year project detects crop disease.", {fingerprint}))
+
     def test_memory_retrieval_is_scoped_to_user_and_active_non_sensitive_rows(self):
         user_id = uuid.uuid4()
         user = User(id=user_id, firebase_uid="uid")
@@ -86,13 +118,29 @@ class MemoryAndIsolationTests(unittest.TestCase):
 
     def test_follow_up_is_limited_to_due_non_sensitive_memory_and_greetings(self):
         user_id = uuid.uuid4(); user = SimpleNamespace(id=user_id)
-        event = Memory(id=uuid.uuid4(), user_id=user_id, content="Interview", category="life_events", status="active", sensitivity="non_sensitive", follow_up_after=main.datetime.now(main.timezone.utc)-main.timedelta(days=1), expires_at=None)
+        now = main.datetime.now(main.timezone.utc)
+        event = Memory(id=uuid.uuid4(), user_id=user_id, content="Interview", category="life_events", status="active", sensitivity="non_sensitive", follow_up_question="How did the interview go?", follow_up_after=now-main.timedelta(days=1), expires_at=None, created_at=now-main.timedelta(days=8), last_mentioned_at=now-main.timedelta(days=8), last_followed_up_at=None)
         class Db:
-            def scalar(self, *_): return None
-            def scalars(self, statement): self.statement=statement; return [event]
+            recent_checkin = None
+            def scalar(self, *_): return self.recent_checkin
+            def scalars(self, statement):
+                self.statement=statement
+                eligible = event.status == "active" and event.last_followed_up_at is None and event.last_mentioned_at >= now-main.timedelta(days=45)
+                return [event] if eligible else []
         db=Db()
-        self.assertIs(memory_service.followup_candidate(db,user,"Hey Buddy"), event)
-        self.assertIsNone(memory_service.followup_candidate(db,user,"I need urgent help"))
+        self.assertIs(memory_service.followup_candidate(db,user,"Hey Buddy",now=now), event)
+        self.assertIsNone(memory_service.followup_candidate(db,user,"What time is it?",now=now))
+        db.recent_checkin = now
+        self.assertIsNone(memory_service.followup_candidate(db,user,"Hey Buddy",now=now+main.timedelta(days=2)))
+        db.recent_checkin = None
+        event.last_followed_up_at = now
+        self.assertIsNone(memory_service.followup_candidate(db,user,"Hey Buddy",now=now+main.timedelta(days=8)))
+        event.last_followed_up_at = None
+        event.status = "resolved"
+        self.assertIsNone(memory_service.followup_candidate(db,user,"Hey Buddy",now=now))
+        event.status = "active"
+        event.last_mentioned_at = now-main.timedelta(days=46)
+        self.assertIsNone(memory_service.followup_candidate(db,user,"Hey Buddy",now=now))
         self.assertIn("memories.user_id", str(db.statement.compile(dialect=postgresql.dialect())))
 
     def test_retrieval_falls_back_to_user_scoped_lexical_search(self):
@@ -177,8 +225,8 @@ class MemoryAndIsolationTests(unittest.TestCase):
             def add(self, _): pass
         db = Db()
         captured = []
-        async def model(messages, memories=(), followup=None):
-            captured.append((messages, list(memories)))
+        async def model(messages, memories=(), past_excerpts=(), followup=None, display_name=None):
+            captured.append((messages, list(memories), list(past_excerpts)))
             return "Your dog's name is Miso."
         client = TestClient(main.app)
         client.app.dependency_overrides[main.optional_chat_user] = lambda: user
@@ -190,6 +238,7 @@ class MemoryAndIsolationTests(unittest.TestCase):
                      patch.object(main, "_memory_enabled", return_value=True), \
                      patch.object(main, "process_one_pending_extraction", new=AsyncMock(return_value=([], set(), {"saved": 0}))), \
                      patch.object(main, "retrieve", new=AsyncMock(return_value=[fact])), \
+                     patch.object(main, "past_chat_retrieve", return_value=[]), \
                      patch.object(main, "_gemini", side_effect=model), \
                      patch.object(main, "extract_and_store", new=AsyncMock(return_value=[])):
                     response = client.post("/chat", headers={"Authorization": "Bearer test-token"}, json={"mode": "account", "message": "What's my dog's name?", "conversation_id": str(conversation.id)})
@@ -214,7 +263,7 @@ class MemoryAndIsolationTests(unittest.TestCase):
         client = TestClient(main.app); db = Db(); captured = []
         client.app.dependency_overrides[main.optional_chat_user] = lambda: user
         client.app.dependency_overrides[main.get_db] = lambda: db
-        async def model(messages, memories=(), followup=None):
+        async def model(messages, memories=(), past_excerpts=(), followup=None, display_name=None):
             captured.append(list(memories)); return "I don't have that detail."
         try:
             for enabled, retrieved in ((False, []), (True, [])):
@@ -222,6 +271,7 @@ class MemoryAndIsolationTests(unittest.TestCase):
                      patch.object(main, "_memory_enabled", return_value=enabled), \
                      patch.object(main, "process_one_pending_extraction", new=AsyncMock(return_value=([], set(), {"saved": 0}))), \
                      patch.object(main, "retrieve", new=AsyncMock(return_value=retrieved)) as retrieve_mock, \
+                     patch.object(main, "past_chat_retrieve", return_value=[]), \
                      patch.object(main, "_gemini", side_effect=model):
                     response = client.post("/chat", headers={"Authorization": "Bearer test-token"}, json={"mode": "account", "message": "What's my dog's name?", "conversation_id": str(conversation.id)})
                 self.assertEqual(response.status_code, 200)
@@ -303,7 +353,7 @@ class MemoryAndIsolationTests(unittest.TestCase):
             def __init__(self): self.scalar_calls = 0; self.added = []; self.committed = False
             def scalar(self, _):
                 self.scalar_calls += 1
-                return uuid.uuid4() if self.scalar_calls == 1 else 0
+                return uuid.uuid4() if self.scalar_calls in (1, 2) else 0
             def add(self, row): self.added.append(row)
             def flush(self): pass
             def commit(self): self.committed = True
@@ -326,7 +376,7 @@ class MemoryAndIsolationTests(unittest.TestCase):
         client = MagicMock(); client.__aenter__ = AsyncMock(return_value=client); client.__aexit__ = AsyncMock(return_value=None); client.post = AsyncMock(return_value=response)
         class Db:
             def __init__(self): self.scalar_calls = 0; self.added = []; self.committed = False
-            def scalar(self, _): self.scalar_calls += 1; return uuid.uuid4() if self.scalar_calls == 1 else 0
+            def scalar(self, _): self.scalar_calls += 1; return uuid.uuid4() if self.scalar_calls in (1, 2) else 0
             def scalars(self, _): return [memory_service.content_fingerprint(fact_text)]
             def add(self, row): self.added.append(row)
             def flush(self): pass
@@ -386,3 +436,4 @@ class MemoryAndIsolationTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+

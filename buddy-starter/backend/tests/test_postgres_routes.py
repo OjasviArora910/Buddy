@@ -29,10 +29,98 @@ class PostgreSQLRouteTests(unittest.TestCase):
         except Exception as exc:
             self.skipTest(f"PostgreSQL unavailable ({type(exc).__name__})")
 
+    def test_cross_conversation_recall_is_bounded_opted_in_and_owner_scoped(self):
+        uid_a = "history-recall-" + uuid.uuid4().hex
+        uid_b = "history-recall-" + uuid.uuid4().hex
+        claims = {"uid": uid_a, "email": None, "name": None, "email_verified": True}
+        captured = []
+        main.app.dependency_overrides[verified_firebase_claims] = lambda: claims
+        main.app.dependency_overrides[verified_firebase_uid] = lambda: claims["uid"]
+
+        async def mocked_gemini(messages, memories=(), past_excerpts=(), followup=None, display_name=None):
+            captured.append((list(messages), list(memories), list(past_excerpts)))
+            return "I have a relevant detail from an earlier chat." if past_excerpts else "I don't have that detail yet."
+
+        try:
+            with patch.dict(os.environ, {"PGVECTOR_ENABLED": "false"}), \
+                 patch.object(main, "verify_token", side_effect=lambda _: claims), \
+                 patch.object(main, "_gemini", side_effect=mocked_gemini), \
+                 patch.object(main, "_generate_conversation_title", new=AsyncMock(return_value="Project chat")), \
+                 patch.object(main, "process_one_pending_extraction", new=AsyncMock(return_value=([], set(), {"saved": 0}))):
+                with TestClient(main.app) as client:
+                    headers = {"Authorization": "Bearer history-test-token"}
+                    self.assertEqual(client.get("/auth/me").status_code, 200)
+                    self.assertEqual(client.put("/memory-settings", json={"automatic_enabled": True}).status_code, 200)
+                    source = client.post("/conversations", json={"title": "Source chat"}).json()["id"]
+                    sent = client.post("/chat", headers=headers, json={"mode": "account", "message": "My final-year project is about crop disease detection.", "conversation_id": source})
+                    self.assertEqual(sent.status_code, 200)
+                    self.assertEqual(client.get("/memories").json(), [])
+                    fresh = client.post("/conversations", json={"title": "New chat"}).json()["id"]
+                    recalled = client.post("/chat", headers=headers, json={"mode": "account", "message": "What do you know about my work?", "conversation_id": fresh})
+                    self.assertEqual(recalled.status_code, 200)
+                    self.assertTrue(any("crop disease detection" in item["content"] for item in captured[-1][2]))
+                    self.assertEqual([m["content"] for m in captured[-1][0]], ["What do you know about my work?"])
+                    transcript = client.get(f"/conversations/{fresh}/messages").json()
+                    self.assertNotIn("crop disease detection", str(transcript))
+
+                    # Expiry is enforced during recall even before the Memories page is opened.
+                    with Session(self.engine) as db:
+                        owner = db.scalar(select(User).where(User.firebase_uid == uid_a))
+                        expired_fact = Memory(user_id=owner.id, content="My final-year project is about crop disease detection.", category="open_threads", source_conversation_id=uuid.UUID(source), source_reason="Learned from chat", sensitivity="non_sensitive", status="active", expires_at=main.datetime.now(main.timezone.utc) - main.timedelta(seconds=1))
+                        db.add(expired_fact)
+                        db.commit()
+                    after_expiry = client.post("/conversations", json={"title": "After expiry"}).json()["id"]
+                    client.post("/chat", headers=headers, json={"mode": "account", "message": "What do you know about my work?", "conversation_id": after_expiry})
+                    self.assertFalse(any("crop disease detection" in item["content"] for item in captured[-1][2]))
+
+                    # A forgotten saved fact must not return through its source transcript.
+                    forgotten_source = client.post("/conversations", json={"title": "Forgotten fact source"}).json()["id"]
+                    client.post("/chat", headers=headers, json={"mode": "account", "message": "My robotics project is a garden sensor.", "conversation_id": forgotten_source})
+                    with Session(self.engine) as db:
+                        owner = db.scalar(select(User).where(User.firebase_uid == uid_a))
+                        forgotten = Memory(user_id=owner.id, content="My robotics project is a garden sensor.", category="open_threads", source_conversation_id=uuid.UUID(forgotten_source), source_reason="Learned from chat", sensitivity="non_sensitive", status="active", expires_at=main.datetime.now(main.timezone.utc) + main.timedelta(days=30))
+                        db.add(forgotten)
+                        db.commit()
+                        forgotten_id = forgotten.id
+                    self.assertEqual(client.delete(f"/memories/{forgotten_id}").status_code, 200)
+                    after_forgotten = client.post("/conversations", json={"title": "After forgotten fact"}).json()["id"]
+                    client.post("/chat", headers=headers, json={"mode": "account", "message": "What do you know about my work?", "conversation_id": after_forgotten})
+                    self.assertFalse(any("garden sensor" in item["content"] for item in captured[-1][2]))
+
+                    unrelated = client.post("/conversations", json={"title": "Unrelated"}).json()["id"]
+                    client.post("/chat", headers=headers, json={"mode": "account", "message": "What is the weather like?", "conversation_id": unrelated})
+                    self.assertEqual(captured[-1][2], [])
+
+                    self.assertEqual(client.put("/memory-settings", json={"automatic_enabled": False}).status_code, 200)
+                    disabled = client.post("/conversations", json={"title": "Disabled"}).json()["id"]
+                    client.post("/chat", headers=headers, json={"mode": "account", "message": "What do you know about my work?", "conversation_id": disabled})
+                    self.assertEqual(captured[-1][2], [])
+
+                    self.assertEqual(client.put("/memory-settings", json={"automatic_enabled": True}).status_code, 200)
+                    self.assertEqual(client.delete(f"/conversations/{source}").status_code, 200)
+                    after_delete = client.post("/conversations", json={"title": "After delete"}).json()["id"]
+                    client.post("/chat", headers=headers, json={"mode": "account", "message": "What do you know about my work?", "conversation_id": after_delete})
+                    self.assertEqual(captured[-1][2], [])
+
+                    claims["uid"] = uid_b
+                    self.assertEqual(client.get("/auth/me").status_code, 200)
+                    self.assertEqual(client.put("/memory-settings", json={"automatic_enabled": True}).status_code, 200)
+                    other = client.post("/conversations", json={"title": "Other account"}).json()["id"]
+                    client.post("/chat", headers=headers, json={"mode": "account", "message": "What do you know about my work?", "conversation_id": other})
+                    self.assertEqual(captured[-1][2], [])
+        finally:
+            main.app.dependency_overrides.pop(verified_firebase_claims, None)
+            main.app.dependency_overrides.pop(verified_firebase_uid, None)
+            with Session(self.engine) as db:
+                ids = list(db.scalars(select(User.id).where(User.firebase_uid.in_([uid_a, uid_b]))))
+                if ids:
+                    db.execute(delete(User).where(User.id.in_(ids)))
+                    db.commit()
+
     def test_authenticated_chat_persists_idempotently_and_enforces_owner(self):
         uid_a = "route-smoke-" + uuid.uuid4().hex
         uid_b = "route-smoke-" + uuid.uuid4().hex
-        claims = {"uid": uid_a, "email": None, "name": None}
+        claims = {"uid": uid_a, "email": None, "name": None, "email_verified": True}
         main.app.dependency_overrides[verified_firebase_claims] = lambda: claims
         main.app.dependency_overrides[verified_firebase_uid] = lambda: claims["uid"]
         try:
@@ -91,12 +179,12 @@ class PostgreSQLRouteTests(unittest.TestCase):
     def test_saved_memory_recall_in_fresh_conversation_obeys_all_exclusion_filters(self):
         uid_a = "memory-recall-" + uuid.uuid4().hex
         uid_b = "memory-recall-" + uuid.uuid4().hex
-        claims = {"uid": uid_a, "email": None, "name": None}
+        claims = {"uid": uid_a, "email": None, "name": None, "email_verified": True}
         captured = []
         main.app.dependency_overrides[verified_firebase_claims] = lambda: claims
         main.app.dependency_overrides[verified_firebase_uid] = lambda: claims["uid"]
 
-        async def mocked_gemini(messages, memories=(), followup=None):
+        async def mocked_gemini(messages, memories=(), past_excerpts=(), followup=None, display_name=None):
             facts = [memory.content for memory in memories]
             captured.append((facts, messages[-1]["content"]))
             return next((fact for fact in facts if "dog's name" in fact), "I don't have that detail.")
@@ -157,7 +245,7 @@ class PostgreSQLRouteTests(unittest.TestCase):
 
     def test_conversation_title_persists_falls_back_and_preserves_manual_rename_race(self):
         uid = "conversation-title-" + uuid.uuid4().hex
-        claims = {"uid": uid, "email": None, "name": None}
+        claims = {"uid": uid, "email": None, "name": None, "email_verified": True}
         main.app.dependency_overrides[verified_firebase_claims] = lambda: claims
         main.app.dependency_overrides[verified_firebase_uid] = lambda: uid
 
@@ -208,7 +296,7 @@ class PostgreSQLRouteTests(unittest.TestCase):
 
     def test_automatic_academic_project_memory_recalled_by_broad_work_question(self):
         uid = "academic-recall-" + uuid.uuid4().hex
-        claims = {"uid": uid, "email": None, "name": None}
+        claims = {"uid": uid, "email": None, "name": None, "email_verified": True}
         captured = []
         main.app.dependency_overrides[verified_firebase_claims] = lambda: claims
         main.app.dependency_overrides[verified_firebase_uid] = lambda: uid
@@ -228,7 +316,7 @@ class PostgreSQLRouteTests(unittest.TestCase):
             async def __aexit__(self, *_): return None
             async def post(self, *_args, **_kwargs): return ProviderResponse()
 
-        async def mocked_gemini(messages, memories=(), followup=None):
+        async def mocked_gemini(messages, memories=(), past_excerpts=(), followup=None, display_name=None):
             facts = [memory.content for memory in memories]
             captured.append((messages[-1]["content"], facts))
             return "I remember your crop disease detection project." if facts else "I don't have that detail."
@@ -284,7 +372,7 @@ class PostgreSQLRouteTests(unittest.TestCase):
 
     def test_automatic_cross_chat_memory_retries_corrects_and_stays_deleted(self):
         uid = "automatic-memory-" + uuid.uuid4().hex
-        claims = {"uid": uid, "email": None, "name": None}
+        claims = {"uid": uid, "email": None, "name": None, "email_verified": True}
         main.app.dependency_overrides[verified_firebase_claims] = lambda: claims
         main.app.dependency_overrides[verified_firebase_uid] = lambda: uid
         captured = []
@@ -315,7 +403,7 @@ class PostgreSQLRouteTests(unittest.TestCase):
                     item = {"content": "My cat's name is Prii", "category": "relationships", "sensitive": False, "confidence": .99, "evidence": "My cat's name is Prii"}
                 generated = {"memories": [item] if item else []}
                 return ProviderResponse({"candidates": [{"content": {"parts": [{"text": json.dumps(generated)}]}}]})
-        async def mocked_gemini(messages, memories=(), followup=None):
+        async def mocked_gemini(messages, memories=(), past_excerpts=(), followup=None, display_name=None):
             facts = [memory.content for memory in memories]
             captured.append((messages[-1]["content"], facts))
             return next((fact for fact in facts if "cat's name" in fact), "I don't have your cat's name yet.")
@@ -334,7 +422,9 @@ class PostgreSQLRouteTests(unittest.TestCase):
                     first = client.post("/chat", headers=headers, json={"mode": "account", "message": "My cat's name is Prii", "conversation_id": first_thread})
                     self.assertEqual(first.status_code, 200)
                     self.assertEqual(first.json()["reply"], "I don't have your cat's name yet.")
-                    self.assertIsNone(first.json()["memory_notice"])
+                    # The provider failed: nothing is saved, the user is told it will retry, and
+                    # the message stays pending (no completion marker) instead of being lost.
+                    self.assertIn("will retry", first.json()["memory_notice"])
                     self.assertEqual(client.get("/memories").json(), [])
 
                     recall_thread = client.post("/conversations", json={"title": "New conversation"}).json()["id"]
@@ -385,3 +475,5 @@ class PostgreSQLRouteTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+

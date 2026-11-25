@@ -1,11 +1,13 @@
 'use client';
-import { FormEvent, useEffect, useRef, useState } from 'react';
+import { FormEvent, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { Suspense } from 'react';
 import Link from 'next/link';
 import { ArrowUp, Heart, Mic, Square, LogOut, Brain, ShieldCheck } from 'lucide-react';
 import { fetchApi } from '../../lib/api';
+import { ProtectedRoute } from '../../components/auth/ProtectedRoute';
 import { authClient } from '../../lib/auth';
+import { useAuth } from '../../components/auth/AuthProvider';
 import styles from './chat-controls.module.css';
 
 type Msg = { id?: string; role: 'user' | 'assistant'; content: string; created_at?: string };
@@ -37,6 +39,7 @@ const categoryLabels: Record<Category, string> = {
 };
 
 function ChatInner() {
+  const { displayName } = useAuth();
   const params = useSearchParams();
   const router = useRouter();
   const mode = params.get('mode') === 'account' ? 'account' : 'quick';
@@ -59,6 +62,11 @@ function ChatInner() {
   const [recording, setRecording] = useState(false);
   const [safety, setSafety] = useState(false);
   const creatingConversation = useRef(false);
+  const busyRef = useRef(false);
+  const draftRef = useRef('');
+  const pageTypedCharacter = useRef(false);
+  const composerForm = useRef<HTMLFormElement>(null);
+  const messageInput = useRef<HTMLInputElement>(null);
   const activeConversation = useRef('');
   const bottom = useRef<HTMLDivElement>(null);
   const recognition = useRef<SpeechRecognitionLike | null>(null);
@@ -89,8 +97,11 @@ function ChatInner() {
         const { data: { session } } = await authClient().auth.getSession();
         if (!session) { router.replace('/login'); return; }
         const headers = { Authorization: `Bearer ${session.access_token}` };
-        const listResponse = await fetchApi('/conversations', { headers });
-        if (!listResponse.ok) throw new Error('Could not load your conversations. Please refresh and try again.');
+        const listResponse = await fetchApi('/conversations', { headers }, 'chat.load_conversations');
+        if (!listResponse.ok) {
+          const details = await listResponse.json().catch(() => ({}));
+          throw new Error(details.detail || 'Could not load your conversations. Please refresh and try again.');
+        }
         const savedConversations: Conversation[] = await listResponse.json();
         if (!active) return;
         setConversations(savedConversations);
@@ -106,7 +117,7 @@ function ChatInner() {
         if (!requestedConversationId) {
           router.replace(`/chat?mode=account&conversation_id=${encodeURIComponent(selectedId)}`);
         }
-        const historyResponse = await fetchApi(`/conversations/${selectedId}/messages?limit=40`, { headers });
+        const historyResponse = await fetchApi(`/conversations/${selectedId}/messages?limit=40`, { headers }, 'chat.load_messages');
         if (!historyResponse.ok) {
           const details = await historyResponse.json().catch(() => ({}));
           const statusText = historyResponse.status === 404
@@ -139,30 +150,76 @@ function ChatInner() {
     return () => { active = false; };
   }, [mode, requestedConversationId, router]);
 
+  function updateDraft(value: string | ((current: string) => string)) {
+    const next = typeof value === 'function' ? value(draftRef.current) : value;
+    draftRef.current = next;
+    setDraft(next);
+  }
+
+  useLayoutEffect(() => {
+    if (ready && window.matchMedia('(min-width: 751px)').matches) {
+      messageInput.current?.focus({ preventScroll: true });
+    }
+  }, [ready, mode, loadedConversationId]);
+
+  useEffect(() => {
+    function focusComposerForPageTyping(event: KeyboardEvent) {
+      const target = event.target;
+      if (
+        !ready
+        || event.key.length !== 1
+        || event.ctrlKey
+        || event.metaKey
+        || event.altKey
+        || event.isComposing
+        || !(target === document.body || target === document.documentElement)
+      ) return;
+      event.preventDefault();
+      pageTypedCharacter.current = true;
+      messageInput.current?.focus({ preventScroll: true });
+      updateDraft((current) => current + event.key);
+    }
+    document.addEventListener('keydown', focusComposerForPageTyping);
+    return () => document.removeEventListener('keydown', focusComposerForPageTyping);
+  }, [ready]);
+
+  useLayoutEffect(() => {
+    if (!pageTypedCharacter.current) return;
+    messageInput.current?.setSelectionRange(draft.length, draft.length);
+    pageTypedCharacter.current = false;
+  }, [draft]);
+
   useEffect(() => { bottom.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, busy, suggestions]);
 
   async function send() {
-    const text = draft.trim();
-    if (!text || busy) return;
+    const text = draftRef.current.trim();
+    if (!text || busyRef.current || !ready) return;
+    const restoreFocus = Boolean(composerForm.current?.contains(document.activeElement));
+    busyRef.current = true;
     setBusy(true);
     let targetConversationId = conversationId;
-    if (mode === 'account' && !targetConversationId) {
-      const created = await createConversation();
-      if (!created) { setBusy(false); return; }
-      targetConversationId = created.id;
-    }
-    const next: Msg[] = [...messages, { role: 'user', content: text }];
-    if (mode !== 'account' || activeConversation.current === targetConversationId) setMessages(next);
-    setDraft('');
-    setError('');
-    setMemoryNotice('');
-    setPersistenceNotice('');
-    setSuggestions([]);
+    let next: Msg[] | null = null;
+    const previousMessages = messages;
     try {
+      if (mode === 'account' && !targetConversationId) {
+        const created = await createConversation();
+        if (!created) return;
+        targetConversationId = created.id;
+      }
+      next = [...previousMessages, { role: 'user', content: text }];
+      if (mode !== 'account' || activeConversation.current === targetConversationId) setMessages(next);
+      updateDraft('');
+      setError('');
+      setMemoryNotice('');
+      setPersistenceNotice('');
+      setSuggestions([]);
       let token = '';
       if (mode === 'account') {
         const { data: { session } } = await authClient().auth.getSession();
         if (!session) {
+          updateDraft((current) => current ? `${text} ${current}` : text);
+          if (mode !== 'account' || activeConversation.current === targetConversationId) setMessages(previousMessages);
+          setError('Your sign-in has expired. Sign in again, then send your message.');
           router.push('/login');
           return;
         }
@@ -175,7 +232,7 @@ function ChatInner() {
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         body: JSON.stringify({ mode, message: text, ...(mode === 'account' ? { conversation_id: targetConversationId, request_id: crypto.randomUUID() } : {}) }),
-      });
+      }, 'chat.send');
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || 'Could not send message.');
       const updatedMessages = [...next, { role: 'assistant' as const, content: body.reply }];
@@ -191,13 +248,17 @@ function ChatInner() {
         setSuggestions(body.memory_suggestions || []);
       }
     } catch (requestError) {
+      updateDraft((current) => current ? `${text} ${current}` : text);
       if (mode !== 'account' || activeConversation.current === targetConversationId) {
         setError(requestError instanceof Error ? requestError.message : 'Something went wrong.');
-        setDraft(text);
-        setMessages(messages);
+        if (next) setMessages(previousMessages);
       }
     } finally {
+      busyRef.current = false;
       setBusy(false);
+      if (restoreFocus && composerForm.current?.contains(document.activeElement)) {
+        messageInput.current?.focus({ preventScroll: true });
+      }
     }
   }
 
@@ -223,7 +284,7 @@ function ChatInner() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
           body: JSON.stringify({ title: 'New conversation' }),
-        });
+        }, 'chat.create_conversation');
         if (!response.ok) throw new Error('Could not create a conversation.');
         const conversation: Conversation = await response.json();
         setConversations((current) => [conversation, ...current]);
@@ -256,7 +317,7 @@ function ChatInner() {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session.access_token}` },
           body: JSON.stringify({ title }),
-        });
+        }, 'chat.rename_conversation');
         if (!response.ok) throw new Error('Could not rename this conversation.');
         const updated: Conversation = await response.json();
         setConversations((current) => current.map((item) => item.id === updated.id ? updated : item));
@@ -274,7 +335,7 @@ function ChatInner() {
         const response = await fetchApi(`/conversations/${targetId}`, {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${session.access_token}` },
-        });
+        }, 'chat.delete_conversation');
         if (!response.ok) throw new Error('Could not delete this conversation.');
         const remaining = conversations.filter((item) => item.id !== targetId);
         setConversations(remaining);
@@ -301,7 +362,7 @@ function ChatInner() {
         const before = encodeURIComponent(messages[0].created_at);
         const response = await fetchApi(`/conversations/${conversationId}/messages?limit=40&before=${before}`, {
           headers: { Authorization: `Bearer ${session.access_token}` },
-        });
+        }, 'chat.load_older_messages');
         if (!response.ok) throw new Error('Could not load older messages.');
         const older: Msg[] = await response.json();
         if (activeConversation.current === conversationId) {
@@ -339,7 +400,7 @@ function ChatInner() {
           retention_days: 90,
           replaces_memory_id: suggestion.replaces_memory_id,
         }),
-      });
+      }, 'memory.save_suggestion');
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || 'Could not save this memory.');
       setSuggestions((current) => current.filter((_, itemIndex) => itemIndex !== index));
@@ -369,7 +430,7 @@ function ChatInner() {
     recognition.current = rec;
     rec.lang = 'en-IN';
     rec.interimResults = false;
-    rec.onresult = (event) => setDraft((value) => (value + ' ' + event.results[0][0].transcript).trim());
+    rec.onresult = (event) => updateDraft((value) => (value + ' ' + event.results[0][0].transcript).trim());
     rec.onerror = (event) => setError('Microphone: ' + event.error);
     rec.onend = () => setRecording(false);
     try {
@@ -415,6 +476,7 @@ function ChatInner() {
           {mode === 'account' && <Link href="/memories"><Brain size={17} /> What Buddy remembers</Link>}
         </div>
         <div className="sideBottom">
+          {mode === 'account' && <span className={styles.accountName}>{displayName || 'Your account'}</span>}
           <span><ShieldCheck size={16} /> AI companion · Internal test</span>
           {mode === 'account'
             ? <button onClick={logout}><LogOut size={16} /> Sign out</button>
@@ -520,17 +582,18 @@ function ChatInner() {
           {error && <div className="error chatError" role="alert">{error}</div>}
           {persistenceNotice && <div className="error chatError" role="alert">{persistenceNotice}</div>}
           {memoryNotice && <div className="memoryNotice" role="status">{memoryNotice}</div>}
-          <form className="composer" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void send(); }}>
+          <form ref={composerForm} className="composer" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void send(); }}>
             <button type="button" className={'mic ' + (recording ? 'active' : '')} onClick={mic} aria-label={recording ? 'Stop voice input' : 'Start voice input'}>
               {recording ? <Square size={19} /> : <Mic size={19} />}
             </button>
             <input
+              ref={messageInput}
               aria-label="Your message"
               value={draft}
-              onChange={(event) => setDraft(event.target.value)}
+              onChange={(event) => updateDraft(event.target.value)}
               placeholder="Message Buddy…"
               maxLength={5000}
-              disabled={!ready || busy}
+              disabled={!ready}
             />
             <button className="send" type="submit" disabled={!draft.trim() || busy || !ready} aria-label="Send message"><ArrowUp size={20} /></button>
           </form>
@@ -541,6 +604,13 @@ function ChatInner() {
   );
 }
 
+function ChatGate() {
+  // Quick Chat stays anonymous. Account chat needs a signed-in, email-verified user,
+  // otherwise show the verification screen instead of a raw 403 from the API.
+  const accountMode = useSearchParams().get('mode') === 'account';
+  return accountMode ? <ProtectedRoute><ChatInner /></ProtectedRoute> : <ChatInner />;
+}
+
 export default function Chat() {
-  return <Suspense fallback={<div className="centerPage">Loading Buddy…</div>}><ChatInner /></Suspense>;
+  return <Suspense fallback={<div className="centerPage">Loading Buddy…</div>}><ChatGate /></Suspense>;
 }

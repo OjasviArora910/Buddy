@@ -4,13 +4,13 @@ Buddy is a calm AI emotional-support companion with **Quick Chat** (anonymous, n
 
 ## V3 migration status
 
-Firebase authentication and PostgreSQL-backed chat, conversations and memory APIs are implemented. Supabase is no longer a runtime dependency. The local PostgreSQL database is at Alembic `0003_memory_metadata`; `0004_pgvector` is pending because the server extension is not installed. Firebase Web API configuration is also missing locally, and live Gemini requests currently fail with a network connection error. Do not treat this branch as a completed v3 release. See [the migration audit](docs/v3-migration-audit.md), [checklist](docs/v3-implementation-checklist.md), and [completion report](docs/v3-completion-report.md).
+Firebase authentication and PostgreSQL-backed chat, conversations and memory APIs are implemented. Supabase is no longer a runtime dependency. The local PostgreSQL database is at Alembic `0003_memory_metadata`; `0004_pgvector` is pending because the server extension is not installed. Firebase Web API configuration is also missing locally, and live Gemini requests currently fail with a network connection error. Alembic now has a merge revision (`0006_merge_heads`): run `alembic upgrade head` when pgvector is installed, otherwise `alembic upgrade 0005_memory_followups`. Account chat and memory routes require a Firebase-verified email, and `frontend/next.config.ts` hides the Next.js dev indicator (restart `npm run dev` to pick it up). Do not treat this branch as a completed v3 release. See [the migration audit](docs/v3-migration-audit.md), [checklist](docs/v3-implementation-checklist.md), and [completion report](docs/v3-completion-report.md).
 
 ## Local setup
 
 1. Configure a Firebase Web app and Firebase Admin credentials using [Firebase setup](docs/firebase-setup.md).
 2. Install local PostgreSQL, create a least-privilege role, and configure `backend/.env` using [PostgreSQL setup](docs/postgresql-setup.md). Copy placeholders from `backend/.env.example`.
-3. Install backend dependencies. Follow `docs/local-development.md` for the pgvector prerequisite; run `alembic upgrade head` from `backend` when the extension is installed, then start `uvicorn app.main:app --reload --port 8000`.
+3. Install backend dependencies. Follow `docs/local-development.md` for the pgvector prerequisite; run `alembic upgrade head` from `backend` when the extension is installed, then start `uvicorn app.main:app --reload --reload-dir app --port 8000`.
 4. Copy `frontend/.env.example` to `frontend/.env.local`, fill in Firebase web identifiers (including the Web API key), run `npm install` and `npm run dev` in `frontend`.
 
 Firebase frontend config consists of public identifiers. Firebase Admin credentials, database passwords, and Gemini keys are backend secrets. Never commit `.env` files or service-account JSON.

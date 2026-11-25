@@ -1,9 +1,10 @@
 'use client';
-import { FormEvent, useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { fetchApi } from '../../lib/api';
 import { authClient } from '../../lib/auth';
+import { ProtectedRoute } from '../../components/auth/ProtectedRoute';
 
 type Category = 'user_profile' | 'relationships' | 'life_events' | 'preferences' | 'open_threads';
 type Memory = {
@@ -11,6 +12,9 @@ type Memory = {
   content: string;
   category: Category;
   sensitive: boolean;
+  status: 'active' | 'resolved';
+  resolved_at: string | null;
+  last_checkin_at: string | null;
   source?: 'learned_from_chat' | 'manual';
   source_reason: string;
   retention_days: number | null;
@@ -24,13 +28,9 @@ const categories: { value: Category; label: string }[] = [
   { value: 'open_threads', label: 'Open threads' },
 ];
 
-export default function Memories() {
+function MemoriesContent() {
   const router = useRouter();
   const [memories, setMemories] = useState<Memory[]>([]);
-  const [draft, setDraft] = useState('');
-  const [category, setCategory] = useState<Category>('preferences');
-  const [sensitive, setSensitive] = useState(false);
-  const [retention, setRetention] = useState('90');
   const [editing, setEditing] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
   const [editCategory, setEditCategory] = useState<Category>('preferences');
@@ -47,6 +47,14 @@ export default function Memories() {
       router.push('/login');
       throw new Error('Please sign in to manage memories.');
     }
+    const method = (init.method || 'GET').toUpperCase();
+    const operation = path === '/memory-settings'
+      ? `memory.settings.${method.toLowerCase()}`
+      : path === '/memories'
+        ? (method === 'DELETE' ? 'memory.delete_all' : 'memory.load')
+        : method === 'PATCH' ? 'memory.retention'
+          : method === 'DELETE' ? 'memory.delete'
+            : method === 'PUT' ? 'memory.update' : 'memory.action';
     const response = await fetchApi(path, {
       ...init,
       headers: {
@@ -54,7 +62,7 @@ export default function Memories() {
         Authorization: `Bearer ${session.access_token}`,
         ...init.headers,
       },
-    });
+    }, operation);
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || 'Request failed.');
     return data;
@@ -92,34 +100,6 @@ export default function Memories() {
       setError(requestError instanceof Error ? requestError.message : 'Could not update memory settings.');
     } finally {
       setSettingsBusy(false);
-    }
-  }
-
-  async function add(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!draft.trim() || busy) return;
-    setBusy(true);
-    setError('');
-    setNotice('');
-    try {
-      await request('/memories', {
-        method: 'POST',
-        body: JSON.stringify({
-          content: draft.trim(),
-          category,
-          sensitive,
-          consent: sensitive,
-          retention_days: retention === 'never' ? null : Number(retention),
-        }),
-      });
-      setDraft('');
-      setSensitive(false);
-      setNotice('Memory saved.');
-      await refresh();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : 'Could not save this memory.');
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -200,13 +180,11 @@ export default function Memories() {
       <div className="memoryCard">
         <Link className="back" href="/chat?mode=account">← Back to chat</Link>
         <h1>What Buddy remembers</h1>
-        <p>You choose what is saved, how long it stays, and what Buddy can use.</p>
+        <p>Review details Buddy learned from your chats, correct anything, or remove it.</p>
         <button type="button" className="deleteMemory" disabled={!memories.length || busy} onClick={() => void removeAll()}>
           Delete all saved facts
         </button>
-        <div className="info">
-          This setting controls both using saved facts in replies and automatically saving suitable details from account chats. Turning it off stops recall and automatic saving; existing facts stay here until you delete them or they expire. Sensitive details are not automatically saved and require your explicit consent for manual saving. Saved facts are sent to Gemini when used for replies. Deleting a conversation removes its messages but keeps saved facts; deleting a fact removes it from future recall but keeps conversation messages.
-        </div>
+        <div className="info">When enabled, Buddy can learn useful details from your account chats and use relevant saved facts or older chat excerpts in a new reply. Turning it off stops saving and both kinds of recall. Sensitive details are excluded. Deleting a saved fact also blocks recall from its source chat.</div>
         <label className="memoryToggle">
           <input
             type="checkbox"
@@ -214,32 +192,8 @@ export default function Memories() {
             disabled={settingsBusy}
             onChange={(event) => void toggleAutomaticMemory(event.target.checked)}
           />
-          Enable recall and automatic saving
+          Enable learning, saved-memory recall, and relevant past-chat context
         </label>
-        <form onSubmit={add} className="memoryForm memoryAddForm">
-          <input
-            value={draft}
-            maxLength={500}
-            required
-            onChange={(event) => setDraft(event.target.value)}
-            placeholder="A detail you want Buddy to remember"
-            aria-label="Memory detail"
-          />
-          <select value={category} onChange={(event) => setCategory(event.target.value as Category)} aria-label="Memory category">
-            {categories.map((item) => <option value={item.value} key={item.value}>{item.label}</option>)}
-          </select>
-          <select value={retention} onChange={(event) => setRetention(event.target.value)} aria-label="Memory retention">
-            <option value="30">Delete after 30 days</option>
-            <option value="90">Delete after 90 days</option>
-            <option value="365">Delete after 1 year</option>
-            <option value="never">Keep until I delete it</option>
-          </select>
-          <label className="consentLabel">
-            <input type="checkbox" checked={sensitive} onChange={(event) => setSensitive(event.target.checked)} />
-            This is sensitive; I explicitly consent to saving it
-          </label>
-          <button className="primary" disabled={busy}>{busy ? 'Saving…' : 'Save memory'}</button>
-        </form>
         {error && <p className="error" role="alert">{error}</p>}
         {notice && <p className="success" role="status">{notice}</p>}
         <div className="memoryList">
@@ -264,8 +218,9 @@ export default function Memories() {
                 <>
                   <div className="memoryContent">
                     <span>{memory.content}</span>
-                    <small>{memory.source === 'learned_from_chat' ? 'Learned from chat' : 'Added by you'} · {categories.find((item) => item.value === memory.category)?.label}{memory.sensitive ? ' · Sensitive' : ''}</small>
+                    <small>{memory.source === 'learned_from_chat' ? 'Learned from chat' : 'Added by you'} · {categories.find((item) => item.value === memory.category)?.label}{memory.sensitive ? ' · Sensitive' : ''} · {memory.status === 'resolved' ? 'Resolved' : 'Active'}</small>
                     <small>Why saved: {memory.source_reason}</small>
+                    {memory.last_checkin_at && <small>Last check-in: {new Date(memory.last_checkin_at).toLocaleDateString()}</small>}
                   </div>
                   <label className="retentionLabel">
                     Keep
@@ -288,4 +243,8 @@ export default function Memories() {
       </div>
     </main>
   );
+}
+
+export default function Memories() {
+  return <ProtectedRoute><MemoriesContent /></ProtectedRoute>;
 }

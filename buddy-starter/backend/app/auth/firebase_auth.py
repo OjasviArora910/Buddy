@@ -103,6 +103,7 @@ def verified_firebase_uid(authorization: str | None = Header(default=None)) -> s
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Firebase sign-in required")
     claims = verify_token(authorization.removeprefix("Bearer "))
+    require_verified_email(claims)
     uid = claims.get("uid")
     if not uid:
         raise HTTPException(status_code=401, detail="Invalid Firebase identity")
@@ -112,4 +113,12 @@ def verified_firebase_uid(authorization: str | None = Header(default=None)) -> s
 def verified_firebase_claims(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Firebase sign-in required")
-    return verify_token(authorization.removeprefix("Bearer "))
+    claims = verify_token(authorization.removeprefix("Bearer "))
+    require_verified_email(claims)
+    return claims
+
+
+def require_verified_email(claims: dict[str, Any]) -> None:
+    """Require a Firebase-verified email before accessing account data."""
+    if claims.get("email_verified") is not True:
+        raise HTTPException(status_code=403, detail="Verify your email before using Buddy account features.")
